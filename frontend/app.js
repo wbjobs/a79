@@ -32,6 +32,10 @@ const App = {
     pendingLockPointIndex: null,
     lockCheckInterval: null,
     _lockAckCallback: null,
+    semiAutoSeeds: {},
+    segmentPreview: null,
+    segmentPreviewColors: null,
+    versions: [],
 
     init() {
         this.me = {
@@ -203,6 +207,18 @@ const App = {
         const intersects = this.raycaster.intersectObject(this.pointCloud);
         if (intersects.length > 0) {
             const idx = intersects[0].index;
+            if (this.mode === 'semiauto') {
+                if (!this.selectedTag && this.tags.length > 0) {
+                    this.selectedTag = this.tags[0].name;
+                    this.renderTags();
+                }
+                if (!this.selectedTag) {
+                    this.showToast('请先选择一个标签', true);
+                    return;
+                }
+                this.addSemiAutoSeed(idx, this.selectedTag);
+                return;
+            }
             const lock = this.isPointLockedByOther(idx);
             if (lock) {
                 this.showToast(`${lock.username} 正在标注这里，请稍候...`, true);
@@ -228,23 +244,303 @@ const App = {
         const minY = Math.min(startNDC.y, endNDC.y);
         const maxY = Math.max(startNDC.y, endNDC.y);
         let skipped = 0;
+        let added = 0;
         const v = new THREE.Vector3();
+        const boxPoints = [];
         for (let i = 0; i < positions.length; i++) {
             v.set(positions[i][0], positions[i][1], positions[i][2]);
             v.project(this.camera);
             if (v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY) {
-                if (this.isPointLockedByOther(i)) {
+                if (this.mode !== 'semiauto' && this.isPointLockedByOther(i)) {
                     skipped++;
                     continue;
                 }
-                this.selectedPoints.add(i);
+                boxPoints.push(i);
             }
         }
-        let msg = `已选择 ${this.selectedPoints.size} 个点`;
-        if (skipped > 0) {
-            msg += `（跳过 ${skipped} 个被锁定的点）`;
+        if (this.mode === 'semiauto') {
+            if (!this.selectedTag && this.tags.length > 0) {
+                this.selectedTag = this.tags[0].name;
+                this.renderTags();
+            }
+            if (!this.selectedTag) {
+                this.showToast('请先选择一个标签', true);
+                return;
+            }
+            for (const idx of boxPoints) {
+                this.addSemiAutoSeed(idx, this.selectedTag, true);
+            }
+            this.showToast(`已添加 ${boxPoints.length} 个种子点到「${this.selectedTag}」`);
+        } else {
+            for (const idx of boxPoints) {
+                this.selectedPoints.add(idx);
+            }
+            let msg = `已选择 ${this.selectedPoints.size} 个点`;
+            if (skipped > 0) {
+                msg += `（跳过 ${skipped} 个被锁定的点）`;
+            }
+            this.showToast(msg);
         }
-        this.showToast(msg);
+    },
+
+    setMode(mode) {
+        this.mode = mode;
+        ['modePoint', 'modeBox', 'modeSemiAuto'].forEach(id => {
+            document.getElementById(id).classList.remove('active');
+        });
+        if (mode === 'point') {
+            document.getElementById('modePoint').classList.add('active');
+        } else if (mode === 'box') {
+            document.getElementById('modeBox').classList.add('active');
+        } else if (mode === 'semiauto') {
+            document.getElementById('modeSemiAuto').classList.add('active');
+        }
+        document.getElementById('semiAutoPanel').style.display = mode === 'semiauto' ? 'block' : 'none';
+        if (mode !== 'semiauto') {
+            this.cancelSegmentation();
+        }
+        this.updateSeedSummary();
+        this.selectedPoints.clear();
+        this.updatePointColors();
+    },
+
+    addSemiAutoSeed(pointIndex, label, batch = false) {
+        if (!this.semiAutoSeeds[label]) {
+            this.semiAutoSeeds[label] = [];
+        }
+        if (!this.semiAutoSeeds[label].includes(pointIndex)) {
+            this.semiAutoSeeds[label].push(pointIndex);
+            this.updatePointColors();
+            if (!batch) {
+                this.showToast(`已添加种子点到「${label}」 (${this.semiAutoSeeds[label].length})`);
+            }
+        } else {
+            this.semiAutoSeeds[label] = this.semiAutoSeeds[label].filter(i => i !== pointIndex);
+            if (this.semiAutoSeeds[label].length === 0) {
+                delete this.semiAutoSeeds[label];
+            }
+            this.updatePointColors();
+            if (!batch) {
+                this.showToast(`已移除种子点`);
+            }
+        }
+        this.updateSeedSummary();
+    },
+
+    clearSemiAutoSeeds() {
+        this.semiAutoSeeds = {};
+        this.segmentPreview = null;
+        document.getElementById('previewPanel').style.display = 'none';
+        this.updateSeedSummary();
+        this.updatePointColors();
+        this.showToast('种子点已清空');
+    },
+
+    updateSeedSummary() {
+        const el = document.getElementById('seedSummary');
+        const keys = Object.keys(this.semiAutoSeeds);
+        if (keys.length === 0) {
+            el.textContent = '暂无种子点';
+            el.style.color = '#aaa';
+            return;
+        }
+        const tagColorMap = {};
+        for (const tag of this.tags) {
+            tagColorMap[tag.name] = tag.color;
+        }
+        let html = '';
+        let total = 0;
+        for (const label of keys) {
+            const count = this.semiAutoSeeds[label].length;
+            total += count;
+            const color = tagColorMap[label] || '#4fc3f7';
+            html += `<div style="display:flex;justify-content:space-between;padding:2px 0">
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:5px"></span>${label}</span>
+                <span>${count} 点</span>
+            </div>`;
+        }
+        html = `<div style="margin-bottom:4px;color:#4fc3f7;font-weight:bold">共 ${total} 个种子点 / ${keys.length} 类</div>` + html;
+        el.innerHTML = html;
+        el.style.color = '#eee';
+    },
+
+    async runSegmentation() {
+        const keys = Object.keys(this.semiAutoSeeds);
+        if (keys.length === 0) {
+            this.showToast('请先添加种子点', true);
+            return;
+        }
+        const method = document.getElementById('segmentMethodSelect').value;
+        this.showLoading('正在执行扩散算法...');
+        try {
+            const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/segment`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    positions: this.pointData.positions,
+                    normals: this.pointData.normals,
+                    seed_points: this.semiAutoSeeds,
+                    method: method
+                })
+            });
+            if (!res.ok) throw new Error((await res.json()).detail || 'Segmentation failed');
+            const data = await res.json();
+            this.hideLoading();
+            this.segmentPreview = data.predicted_labels;
+            this.showSegmentPreview(data);
+            this.updatePointColors();
+            this.showToast(`扩散完成！共预测 ${data.total_predicted} 个点`);
+        } catch (e) {
+            this.hideLoading();
+            this.showToast('扩散失败: ' + e.message, true);
+        }
+    },
+
+    showSegmentPreview(data) {
+        const panel = document.getElementById('previewPanel');
+        const summary = document.getElementById('previewSummary');
+        const tagColorMap = {};
+        for (const tag of this.tags) {
+            tagColorMap[tag.name] = tag.color;
+        }
+        let html = '';
+        for (const [label, count] of Object.entries(data.per_label_counts)) {
+            const seedsCount = (data.seed_points[label] || []).length;
+            const color = tagColorMap[label] || '#4fc3f7';
+            html += `<div style="display:flex;justify-content:space-between;padding:2px 0">
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:5px"></span>${label}</span>
+                <span>+${count - seedsCount} (种子${seedsCount})</span>
+            </div>`;
+        }
+        summary.innerHTML = html;
+        panel.style.display = 'block';
+    },
+
+    async confirmSegmentation() {
+        if (!this.segmentPreview) return;
+        this.showLoading('正在应用标注...');
+        try {
+            const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/segment/apply`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: this.me.user_id,
+                    username: this.me.username,
+                    user_color: this.me.color,
+                    predictions: this.segmentPreview
+                })
+            });
+            if (!res.ok) throw new Error('Apply failed');
+            const data = await res.json();
+            this.hideLoading();
+            this.showToast(`成功应用 ${data.applied_count} 个新标注`);
+            this.segmentPreview = null;
+            this.semiAutoSeeds = {};
+            document.getElementById('previewPanel').style.display = 'none';
+            this.updateSeedSummary();
+            this.updatePointColors();
+        } catch (e) {
+            this.hideLoading();
+            this.showToast('应用失败: ' + e.message, true);
+        }
+    },
+
+    cancelSegmentation() {
+        this.segmentPreview = null;
+        document.getElementById('previewPanel').style.display = 'none';
+        this.updatePointColors();
+    },
+
+    async saveCurrentVersion() {
+        const name = document.getElementById('versionNameInput').value.trim();
+        this.showLoading('保存版本中...');
+        try {
+            const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/versions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: this.me.user_id,
+                    username: this.me.username,
+                    user_color: this.me.color,
+                    name: name || undefined
+                })
+            });
+            if (!res.ok) throw new Error('Save version failed');
+            const data = await res.json();
+            this.hideLoading();
+            document.getElementById('versionNameInput').value = '';
+            this.showToast(`版本「${data.version.name}」已保存`);
+        } catch (e) {
+            this.hideLoading();
+            this.showToast('保存失败: ' + e.message, true);
+        }
+    },
+
+    renderVersions() {
+        const listEl = document.getElementById('versionList');
+        if (!this.versions || this.versions.length === 0) {
+            listEl.innerHTML = '<div style="color:#aaa">暂无保存版本</div>';
+            return;
+        }
+        let html = '';
+        for (const v of this.versions) {
+            const date = new Date(v.created_at * 1000);
+            const timeStr = `${date.getMonth()+1}-${date.getDate()} ${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
+            html += `<div style="padding:6px 4px;border-bottom:1px solid #0f3460;margin-bottom:4px">
+                <div style="display:flex;align-items:center;margin-bottom:3px">
+                    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${v.created_by_color || '#4fc3f7'};margin-right:5px"></span>
+                    <span style="font-weight:bold;font-size:12px">${v.name}</span>
+                </div>
+                <div style="font-size:11px;color:#aaa;margin-bottom:4px">
+                    ${v.created_by_username} · ${timeStr}<br>
+                    ${v.annotations_count} 个标注
+                </div>
+                <div style="display:flex;gap:3px">
+                    <button onclick="App.restoreVersion('${v.version_id}')" style="padding:2px 6px;font-size:11px;background:#2ecc71;border-color:#2ecc71">回退</button>
+                    <button onclick="App.deleteVersion('${v.version_id}')" style="padding:2px 6px;font-size:11px;background:#e74c3c;border-color:#e74c3c">删除</button>
+                </div>
+            </div>`;
+        }
+        listEl.innerHTML = html;
+    },
+
+    async restoreVersion(versionId) {
+        if (!confirm('确定要回退到该版本吗？当前所有未保存的修改将丢失！')) return;
+        this.showLoading('正在回退版本...');
+        try {
+            const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/versions/${encodeURIComponent(versionId)}/restore`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: this.me.user_id,
+                    username: this.me.username
+                })
+            });
+            if (!res.ok) throw new Error('Restore failed');
+            const data = await res.json();
+            this.hideLoading();
+            this.showToast(`已回退到版本「${data.version_id}」`);
+        } catch (e) {
+            this.hideLoading();
+            this.showToast('回退失败: ' + e.message, true);
+        }
+    },
+
+    async deleteVersion(versionId) {
+        if (!confirm('确定删除该版本吗？')) return;
+        try {
+            await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/versions/${encodeURIComponent(versionId)}`, {
+                method: 'DELETE'
+            });
+            const idx = this.versions.findIndex(v => v.version_id === versionId);
+            if (idx >= 0) {
+                this.versions.splice(idx, 1);
+            }
+            this.renderVersions();
+            this.showToast('版本已删除');
+        } catch (e) {
+            this.showToast('删除失败', true);
+        }
     },
 
     updatePointColors() {
@@ -257,6 +553,36 @@ const App = {
                 colors[idx * 3] = c.r;
                 colors[idx * 3 + 1] = c.g;
                 colors[idx * 3 + 2] = c.b;
+            }
+        }
+        if (this.segmentPreview) {
+            const tagColorMap = {};
+            for (const tag of this.tags) {
+                tagColorMap[tag.name] = new THREE.Color(tag.color);
+            }
+            for (const [label, pointIndices] of Object.entries(this.segmentPreview)) {
+                const c = tagColorMap[label] || new THREE.Color(0x4fc3f7);
+                for (const pointIdx of pointIndices) {
+                    if (pointIdx < colors.length / 3 && !(pointIdx in this.annotations)) {
+                        colors[pointIdx * 3] = c.r * 0.6;
+                        colors[pointIdx * 3 + 1] = c.g * 0.6;
+                        colors[pointIdx * 3 + 2] = c.b * 0.6;
+                    }
+                }
+            }
+        }
+        for (const [label, seedIndices] of Object.entries(this.semiAutoSeeds)) {
+            const tagColorMap = {};
+            for (const tag of this.tags) {
+                tagColorMap[tag.name] = new THREE.Color(tag.color);
+            }
+            const c = tagColorMap[label] || new THREE.Color(0xffff00);
+            for (const seedIdx of seedIndices) {
+                if (seedIdx < colors.length / 3) {
+                    colors[seedIdx * 3] = Math.min(1, c.r * 1.4);
+                    colors[seedIdx * 3 + 1] = Math.min(1, c.g * 1.4);
+                    colors[seedIdx * 3 + 2] = Math.min(1, c.b * 1.4);
+                }
             }
         }
         for (const [lockIdxStr, lock] of Object.entries(this.locks)) {
@@ -296,15 +622,35 @@ const App = {
         });
 
         document.getElementById('modePoint').addEventListener('click', () => {
-            this.mode = 'point';
-            document.getElementById('modePoint').classList.add('active');
-            document.getElementById('modeBox').classList.remove('active');
+            this.setMode('point');
         });
 
         document.getElementById('modeBox').addEventListener('click', () => {
-            this.mode = 'box';
-            document.getElementById('modeBox').classList.add('active');
-            document.getElementById('modePoint').classList.remove('active');
+            this.setMode('box');
+        });
+
+        document.getElementById('modeSemiAuto').addEventListener('click', () => {
+            this.setMode('semiauto');
+        });
+
+        document.getElementById('runSegmentBtn').addEventListener('click', () => {
+            this.runSegmentation();
+        });
+
+        document.getElementById('clearSeedsBtn').addEventListener('click', () => {
+            this.clearSemiAutoSeeds();
+        });
+
+        document.getElementById('confirmSegmentBtn').addEventListener('click', () => {
+            this.confirmSegmentation();
+        });
+
+        document.getElementById('cancelSegmentBtn').addEventListener('click', () => {
+            this.cancelSegmentation();
+        });
+
+        document.getElementById('saveVersionBtn').addEventListener('click', () => {
+            this.saveCurrentVersion();
         });
 
         document.getElementById('addTagBtn').addEventListener('click', () => {
@@ -411,11 +757,16 @@ const App = {
         this.annotations = {};
         this.locks = {};
         this.myLock = null;
+        this.versions = [];
+        this.semiAutoSeeds = {};
+        this.segmentPreview = null;
         this.selectedPoints.clear();
         if (this.lockCheckInterval) {
             clearInterval(this.lockCheckInterval);
             this.lockCheckInterval = null;
         }
+        document.getElementById('previewPanel').style.display = 'none';
+        document.getElementById('semiAutoPanel').style.display = this.mode === 'semiauto' ? 'block' : 'none';
         try {
             const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(modelName)}/pointcloud?resolution=${resolution}`);
             if (!res.ok) throw new Error('Failed to load pointcloud');
@@ -424,10 +775,23 @@ const App = {
             this.renderPointCloud(data);
             this.loadTags();
             this.loadUsers();
+            this.loadVersions();
             this.connectWebSocket();
+            this.updateSeedSummary();
         } catch (e) {
             this.hideLoading();
             this.showToast('加载失败: ' + e.message, true);
+        }
+    },
+
+    async loadVersions() {
+        try {
+            const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(this.modelName)}/versions`);
+            const data = await res.json();
+            this.versions = data.versions || [];
+            this.renderVersions();
+        } catch (e) {
+            console.error('Load versions failed:', e);
         }
     },
 
@@ -941,6 +1305,38 @@ const App = {
                 break;
             case 'lock_released':
                 this.removeLock(msg.point_index);
+                break;
+            case 'versions_init':
+                this.versions = msg.versions || [];
+                this.renderVersions();
+                break;
+            case 'version_saved':
+                if (msg.version) {
+                    this.versions.unshift(msg.version);
+                    this.renderVersions();
+                }
+                if (msg.version && msg.version.created_by === this.me.user_id) {
+                    this.showToast(`版本「${msg.version.name}」已保存`);
+                } else if (msg.version) {
+                    this.showToast(`${msg.version.created_by_username} 保存了版本「${msg.version.name}」`);
+                }
+                break;
+            case 'version_restored':
+                this.annotations = {};
+                if (msg.annotations) {
+                    msg.annotations.forEach(a => {
+                        this.annotations[a.point_index] = a;
+                    });
+                }
+                if (msg.tags) {
+                    this.tags = msg.tags;
+                    this.renderTags();
+                }
+                this.updatePointColors();
+                this.updateStats();
+                if (msg.restored_by && msg.restored_by.user_id !== this.me.user_id) {
+                    this.showToast(`${msg.restored_by.username} 回退到版本「${msg.version_name}」`, true);
+                }
                 break;
         }
     },

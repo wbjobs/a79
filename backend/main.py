@@ -15,6 +15,7 @@ from voxelizer import (
     get_model_path, load_voxelized, save_voxelized
 )
 from annotation_store import store, User, PointAnnotation, LockInfo
+from segmentation import run_segmentation
 
 
 app = FastAPI(title="3D Point Cloud Annotation API")
@@ -289,6 +290,136 @@ async def get_conflict_logs(model_name: str, limit: int = 100):
     return {"logs": logs}
 
 
+@app.post("/api/models/{model_name}/segment")
+async def segment_auto(model_name: str, payload: Dict[str, Any]):
+    positions = payload.get("positions")
+    normals = payload.get("normals")
+    seed_points = payload.get("seed_points", {})
+    method = payload.get("method", "auto")
+    if not positions or not seed_points:
+        raise HTTPException(status_code=400, detail="Missing positions or seed_points")
+    total_seeds = sum(len(v) for v in seed_points.values())
+    if total_seeds == 0:
+        raise HTTPException(status_code=400, detail="No seed points provided")
+    try:
+        result = run_segmentation(
+            positions, normals, seed_points, method=method
+        )
+        total_predicted = sum(len(v) for v in result.values())
+        return {
+            "success": True,
+            "seed_points": seed_points,
+            "predicted_labels": result,
+            "total_seeds": total_seeds,
+            "total_predicted": total_predicted,
+            "method": method,
+            "per_label_counts": {k: len(v) for k, v in result.items()}
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Segmentation failed: {str(e)}")
+
+
+@app.post("/api/models/{model_name}/segment/apply")
+async def apply_segmentation(model_name: str, payload: Dict[str, Any]):
+    user_id = payload.get("user_id")
+    username = payload.get("username", "unknown")
+    user_color = payload.get("user_color", "#ffffff")
+    predictions = payload.get("predictions", {})
+    if not user_id or not predictions:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    user = User(user_id=user_id, username=username, color=user_color)
+    all_annotations = []
+    for label, point_indices in predictions.items():
+        if not point_indices or not label:
+            continue
+        new_indices = []
+        for idx in point_indices:
+            existing = store.get_annotation(model_name, idx)
+            if existing is None:
+                new_indices.append(idx)
+        if new_indices:
+            annotations = store.annotate_points(model_name, new_indices, label, user)
+            all_annotations.extend(annotations)
+    annotations_dicts = [a.to_dict() for a in all_annotations]
+    if annotations_dicts:
+        await manager.broadcast(model_name, {
+            "type": "annotations_added",
+            "annotations": annotations_dicts,
+            "by_user": user_id
+        })
+    return {
+        "success": True,
+        "applied_count": len(all_annotations),
+        "annotations": annotations_dicts
+    }
+
+
+@app.get("/api/models/{model_name}/versions")
+async def list_versions(model_name: str):
+    versions = store.list_versions(model_name)
+    return {"versions": versions}
+
+
+@app.post("/api/models/{model_name}/versions")
+async def save_version(model_name: str, payload: Dict[str, Any]):
+    user_id = payload.get("user_id")
+    username = payload.get("username", "unknown")
+    user_color = payload.get("user_color", "#ffffff")
+    name = payload.get("name")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+    user = User(user_id=user_id, username=username, color=user_color)
+    version_info = store.save_version(model_name, user, name=name)
+    await manager.broadcast(model_name, {
+        "type": "version_saved",
+        "version": {
+            "version_id": version_info["version_id"],
+            "name": version_info["name"],
+            "created_at": version_info["created_at"],
+            "created_by_username": version_info["created_by_username"],
+            "created_by_color": version_info["created_by_color"],
+            "annotations_count": version_info["annotations_count"]
+        }
+    })
+    return {"version": version_info}
+
+
+@app.post("/api/models/{model_name}/versions/{version_id}/restore")
+async def restore_version(model_name: str, version_id: str, payload: Dict[str, Any]):
+    user_id = payload.get("user_id")
+    username = payload.get("username", "unknown")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+    result = store.restore_version(model_name, version_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Version not found")
+    all_annotations = store.get_all_annotations(model_name)
+    annotations_list = []
+    for idx, ann in all_annotations.items():
+        annotations_list.append(ann.to_dict())
+    tags = store.get_tags(model_name)
+    await manager.broadcast(model_name, {
+        "type": "version_restored",
+        "version_id": version_id,
+        "version_name": result.get("name", version_id),
+        "annotations": annotations_list,
+        "tags": tags,
+        "restored_by": {"user_id": user_id, "username": username}
+    })
+    return {
+        "success": True,
+        "version_id": version_id,
+        "annotations_restored": len(annotations_list),
+        "tags_restored": tags
+    }
+
+
+@app.delete("/api/models/{model_name}/versions/{version_id}")
+async def delete_version(model_name: str, version_id: str):
+    success = store.delete_version(model_name, version_id)
+    return {"success": success}
+
+
 @app.websocket("/ws/{model_name}")
 async def websocket_endpoint(websocket: WebSocket, model_name: str):
     await websocket.accept()
@@ -334,6 +465,11 @@ async def websocket_endpoint(websocket: WebSocket, model_name: str):
         await websocket.send_json({
             "type": "locks_init",
             "locks": locks_list
+        })
+        versions = store.list_versions(model_name)
+        await websocket.send_json({
+            "type": "versions_init",
+            "versions": versions
         })
         while True:
             msg = await websocket.receive_json()

@@ -545,20 +545,149 @@ class AnnotationStore:
                 continue
         return result
 
-    def clear_model_annotations(self, model_name: str) -> bool:
-        pattern = self._key("*", model_name, "*")
+    def save_version(self, model_name: str, user: User, name: Optional[str] = None) -> Dict[str, Any]:
+        version_id = f"v_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        annotations = self.get_all_annotations(model_name)
+        annotations_list = []
+        for idx, ann in annotations.items():
+            annotations_list.append(ann.to_dict())
+        tags = self.get_tags(model_name)
+        version_info = {
+            "version_id": version_id,
+            "name": name or f"版本 {len(self.list_versions(model_name)) + 1}",
+            "created_at": time.time(),
+            "created_by": user.user_id,
+            "created_by_username": user.username,
+            "created_by_color": user.color,
+            "annotations_count": len(annotations_list),
+            "annotations": annotations_list,
+            "tags": tags,
+            "description": ""
+        }
+        versions_key = self._key("versions", model_name)
+        version_data_key = self._key("version", model_name, version_id)
         if self.available:
-            keys = list(self.redis.scan_iter(match=pattern))
-            simple_keys = [self._key("users", model_name),
-                           self._key("tags", model_name),
-                           self._key("tag_colors", model_name),
-                           self._key("annotations", model_name),
-                           self._key("locks", model_name),
-                           self._key("conflict_logs", model_name)]
-            for k in simple_keys:
-                keys.append(k)
-            for k in set(keys):
+            self.redis.lpush(versions_key, version_id)
+            self.redis.ltrim(versions_key, 0, 99)
+            self.redis.set(version_data_key, json.dumps(version_info))
+        else:
+            if versions_key not in self._memory:
+                self._memory[versions_key] = []
+            self._memory[versions_key].insert(0, version_id)
+            if len(self._memory[versions_key]) > 100:
+                self._memory[versions_key] = self._memory[versions_key][:100]
+            self._memory[version_data_key] = json.dumps(version_info)
+        return version_info
+
+    def list_versions(self, model_name: str) -> List[Dict[str, Any]]:
+        versions_key = self._key("versions", model_name)
+        if self.available:
+            version_ids = self.redis.lrange(versions_key, 0, -1) or []
+        else:
+            version_ids = self._memory.get(versions_key, [])
+        result = []
+        for vid in version_ids:
+            version_data_key = self._key("version", model_name, vid)
+            version_data = self._get_key(version_data_key)
+            if version_data and isinstance(version_data, dict):
+                summary = {
+                    "version_id": version_data.get("version_id", vid),
+                    "name": version_data.get("name", vid),
+                    "created_at": version_data.get("created_at", 0),
+                    "created_by": version_data.get("created_by", ""),
+                    "created_by_username": version_data.get("created_by_username", ""),
+                    "created_by_color": version_data.get("created_by_color", ""),
+                    "annotations_count": version_data.get("annotations_count", 0),
+                    "description": version_data.get("description", "")
+                }
+                result.append(summary)
+        return result
+
+    def get_version(self, model_name: str, version_id: str) -> Optional[Dict[str, Any]]:
+        version_data_key = self._key("version", model_name, version_id)
+        version_data = self._get_key(version_data_key)
+        if version_data and isinstance(version_data, dict):
+            return version_data
+        return None
+
+    def restore_version(self, model_name: str, version_id: str) -> Optional[Dict[str, Any]]:
+        version_data = self.get_version(model_name, version_id)
+        if not version_data:
+            return None
+        self.clear_model_annotations(model_name)
+        annotations_key = self._key("annotations", model_name)
+        label_sets: Dict[str, Set[str]] = {}
+        user_sets: Dict[str, Set[str]] = {}
+        user_label_sets: Dict[str, Dict[str, Set[str]]] = {}
+        tags_key = self._key("tags", model_name)
+        tag_colors_key = self._key("tag_colors", model_name)
+        for tag in version_data.get("tags", []):
+            self._add_to_set(tags_key, tag["name"])
+            self._set_hash(tag_colors_key, {tag["name"]: tag.get("color", "#4fc3f7")})
+        for ann_data in version_data.get("annotations", []):
+            point_index = str(ann_data.get("point_index"))
+            label = ann_data.get("label", "")
+            user_id = ann_data.get("user_id", "")
+            if not point_index or not label:
+                continue
+            self._set_hash(annotations_key, {point_index: ann_data})
+            if label not in label_sets:
+                label_sets[label] = set()
+            label_sets[label].add(point_index)
+            if user_id:
+                if user_id not in user_sets:
+                    user_sets[user_id] = set()
+                user_sets[user_id].add(point_index)
+                if user_id not in user_label_sets:
+                    user_label_sets[user_id] = {}
+                if label not in user_label_sets[user_id]:
+                    user_label_sets[user_id][label] = set()
+                user_label_sets[user_id][label].add(point_index)
+        for label, points in label_sets.items():
+            if points:
+                self._add_to_set(self._key("label_points", model_name, label), *points)
+        for uid, points in user_sets.items():
+            if points:
+                self._add_to_set(self._key("user_points", model_name, uid), *points)
+        for uid, labels in user_label_sets.items():
+            for label, points in labels.items():
+                if points:
+                    self._add_to_set(self._key("user_label_points", model_name, uid, label), *points)
+        return version_data
+
+    def delete_version(self, model_name: str, version_id: str) -> bool:
+        versions_key = self._key("versions", model_name)
+        version_data_key = self._key("version", model_name, version_id)
+        if self.available:
+            self.redis.lrem(versions_key, 0, version_id)
+            self.redis.delete(version_data_key)
+        else:
+            if versions_key in self._memory and version_id in self._memory[versions_key]:
+                self._memory[versions_key].remove(version_id)
+            if version_data_key in self._memory:
+                del self._memory[version_data_key]
+        return True
+
+    def clear_model_annotations(self, model_name: str) -> bool:
+        annotations_key = self._key("annotations", model_name)
+        if self.available:
+            all_keys = set(self.redis.scan_iter(match=self._key("annotations", model_name, "*")))
+            all_keys.update(self.redis.scan_iter(match=self._key("label_points", model_name, "*")))
+            all_keys.update(self.redis.scan_iter(match=self._key("user_points", model_name, "*")))
+            all_keys.update(self.redis.scan_iter(match=self._key("user_label_points", model_name, "*", "*")))
+            all_keys.add(annotations_key)
+            for k in all_keys:
                 self.redis.delete(k)
+        else:
+            for prefix in ["annotations", "label_points", "user_points", "user_label_points"]:
+                pattern = self._key(prefix, model_name)
+                keys_to_del = []
+                for k in [self._memory, self._memory_sets, self._memory_hashes]:
+                    for key in list(k.keys()):
+                        if key.startswith(pattern):
+                            keys_to_del.append((k, key))
+                for store_dict, key in keys_to_del:
+                    del store_dict[key]
         return True
 
 
