@@ -31,6 +31,7 @@
                 <label>选择模式:</label>
                 <button id="modePoint" class="active">点选</button>
                 <button id="modeBox">框选</button>
+                <button id="releaseLockBtn" style="display:none">释放锁</button>
             </div>
         </div>
 
@@ -55,6 +56,20 @@
                 <div><label>昵称:</label><input type="text" id="usernameInput" placeholder="输入昵称"></div>
                 <div><label>颜色:</label><input type="color" id="userColorInput" value="#ff0000"></div>
                 <button id="saveUserBtn">保存</button>
+            </div>
+            <h3 style="margin-top:20px">锁状态</h3>
+            <div id="lockStatus" style="font-size:12px;color:#aaa">
+                <div id="lockInfo" style="display:none">
+                    <div class="stat-row">
+                        <span>当前锁定</span>
+                        <span id="lockOwner" style="color:#ff5555"></span>
+                    </div>
+                    <div class="stat-row">
+                        <span>锁定点数</span>
+                        <span id="lockPointCount">0</span>
+                    </div>
+                </div>
+                <div id="noLockInfo">当前无区域被锁定</div>
             </div>
             <h3 style="margin-top:20px">标注统计</h3>
             <div id="stats"></div>

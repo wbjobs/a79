@@ -26,6 +26,12 @@ const App = {
     raycaster: new THREE.Raycaster(),
     mouse: new THREE.Vector2(),
     mouseNormalized: new THREE.Vector2(),
+    locks: {},
+    lockMeshes: [],
+    myLock: null,
+    pendingLockPointIndex: null,
+    lockCheckInterval: null,
+    _lockAckCallback: null,
 
     init() {
         this.me = {
@@ -182,12 +188,26 @@ const App = {
         }
     },
 
+    isPointLockedByOther(pointIndex) {
+        for (const lock of Object.values(this.locks)) {
+            if (lock.user_id !== this.me.user_id && lock.locked_points.includes(pointIndex)) {
+                return lock;
+            }
+        }
+        return null;
+    },
+
     pickPoint(e, replace = false) {
         if (!this.pointCloud) return;
         this.raycaster.setFromCamera(this.mouseNormalized, this.camera);
         const intersects = this.raycaster.intersectObject(this.pointCloud);
         if (intersects.length > 0) {
             const idx = intersects[0].index;
+            const lock = this.isPointLockedByOther(idx);
+            if (lock) {
+                this.showToast(`${lock.username} 正在标注这里，请稍候...`, true);
+                return;
+            }
             if (replace) {
                 this.selectedPoints.clear();
             }
@@ -207,16 +227,24 @@ const App = {
         const maxX = Math.max(startNDC.x, endNDC.x);
         const minY = Math.min(startNDC.y, endNDC.y);
         const maxY = Math.max(startNDC.y, endNDC.y);
-
+        let skipped = 0;
         const v = new THREE.Vector3();
         for (let i = 0; i < positions.length; i++) {
             v.set(positions[i][0], positions[i][1], positions[i][2]);
             v.project(this.camera);
             if (v.x >= minX && v.x <= maxX && v.y >= minY && v.y <= maxY) {
+                if (this.isPointLockedByOther(i)) {
+                    skipped++;
+                    continue;
+                }
                 this.selectedPoints.add(i);
             }
         }
-        this.showToast(`已选择 ${this.selectedPoints.size} 个点`);
+        let msg = `已选择 ${this.selectedPoints.size} 个点`;
+        if (skipped > 0) {
+            msg += `（跳过 ${skipped} 个被锁定的点）`;
+        }
+        this.showToast(msg);
     },
 
     updatePointColors() {
@@ -229,6 +257,16 @@ const App = {
                 colors[idx * 3] = c.r;
                 colors[idx * 3 + 1] = c.g;
                 colors[idx * 3 + 2] = c.b;
+            }
+        }
+        for (const [lockIdxStr, lock] of Object.entries(this.locks)) {
+            if (lock.user_id === this.me.user_id) continue;
+            for (const pointIdx of lock.locked_points) {
+                if (pointIdx < colors.length / 3) {
+                    colors[pointIdx * 3] = 1.0;
+                    colors[pointIdx * 3 + 1] = 0.2;
+                    colors[pointIdx * 3 + 2] = 0.2;
+                }
             }
         }
         const highlightColor = new THREE.Color(0xffffff);
@@ -282,10 +320,20 @@ const App = {
             this.saveUserInfo();
         });
 
+        document.getElementById('releaseLockBtn').addEventListener('click', () => {
+            if (this.myLock) {
+                this.releaseLock(this.myLock.point_index);
+                this.showToast('锁已释放');
+            }
+        });
+
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && this.selectedPoints.size > 0) {
                 this.annotateSelectedPoints();
             } else if (e.key === 'Escape') {
+                if (this.myLock) {
+                    this.releaseLock(this.myLock.point_index);
+                }
                 this.selectedPoints.clear();
                 this.updatePointColors();
             } else if (e.key === 'Delete' && this.hoveredPoint !== null) {
@@ -361,7 +409,13 @@ const App = {
         this.modelName = modelName;
         this.showLoading('加载点云...');
         this.annotations = {};
+        this.locks = {};
+        this.myLock = null;
         this.selectedPoints.clear();
+        if (this.lockCheckInterval) {
+            clearInterval(this.lockCheckInterval);
+            this.lockCheckInterval = null;
+        }
         try {
             const res = await fetch(`${API_BASE}/api/models/${encodeURIComponent(modelName)}/pointcloud?resolution=${resolution}`);
             if (!res.ok) throw new Error('Failed to load pointcloud');
@@ -385,6 +439,7 @@ const App = {
             this.pointCloud.material.dispose();
             this.pointCloud = null;
         }
+        this.clearLockMeshes();
         const positions = data.positions;
         const normals = data.normals;
         const count = positions.length;
@@ -438,6 +493,221 @@ const App = {
         this.camera.position.copy(center).add(new THREE.Vector3(distance, distance * 0.7, distance));
         this.controls.target.copy(center);
         this.controls.update();
+        this.startLockCheck();
+    },
+
+    renderLockRegion(lock) {
+        const radiusM = lock.radius / 100.0;
+        const geometry = new THREE.SphereGeometry(radiusM, 16, 16);
+        const material = new THREE.MeshBasicMaterial({
+            color: lock.user_id === this.me.user_id ? 0x4fc3f7 : 0xff3333,
+            transparent: true,
+            opacity: 0.15,
+            wireframe: false
+        });
+        const sphere = new THREE.Mesh(geometry, material);
+        sphere.position.set(lock.center_point[0], lock.center_point[1], lock.center_point[2]);
+        sphere.userData.isLockMesh = true;
+        sphere.userData.lockId = lock.lock_id;
+
+        const wireGeometry = new THREE.SphereGeometry(radiusM * 1.02, 16, 16);
+        const wireMaterial = new THREE.MeshBasicMaterial({
+            color: lock.user_id === this.me.user_id ? 0x4fc3f7 : 0xff3333,
+            transparent: true,
+            opacity: 0.4,
+            wireframe: true
+        });
+        const wireSphere = new THREE.Mesh(wireGeometry, wireMaterial);
+        wireSphere.position.copy(sphere.position);
+        wireSphere.userData.isLockMesh = true;
+        wireSphere.userData.lockId = lock.lock_id;
+
+        this.scene.add(sphere);
+        this.scene.add(wireSphere);
+        this.lockMeshes.push(sphere, wireSphere);
+
+        if (lock.user_id !== this.me.user_id) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'rgba(255, 51, 51, 0.9)';
+            ctx.roundRect(0, 0, 256, 64, 8);
+            ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 20px Microsoft YaHei';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`${lock.username} 正在标注这里`, 128, 32);
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMaterial = new THREE.SpriteMaterial({
+                map: texture,
+                transparent: true,
+                depthTest: false
+            });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.position.set(lock.center_point[0], lock.center_point[1] + radiusM + 0.05, lock.center_point[2]);
+            sprite.scale.set(0.4, 0.1, 1);
+            sprite.userData.isLockMesh = true;
+            sprite.userData.lockId = lock.lock_id;
+            this.scene.add(sprite);
+            this.lockMeshes.push(sprite);
+        }
+    },
+
+    clearLockMeshes() {
+        for (const mesh of this.lockMeshes) {
+            this.scene.remove(mesh);
+            if (mesh.geometry) mesh.geometry.dispose();
+            if (mesh.material) {
+                if (mesh.material.map) mesh.material.map.dispose();
+                mesh.material.dispose();
+            }
+        }
+        this.lockMeshes = [];
+    },
+
+    renderAllLocks() {
+        this.clearLockMeshes();
+        for (const lock of Object.values(this.locks)) {
+            this.renderLockRegion(lock);
+        }
+        this.updateLockStatus();
+    },
+
+    addLock(lock) {
+        this.locks[lock.point_index] = lock;
+        if (lock.user_id === this.me.user_id) {
+            this.myLock = lock;
+        }
+        this.renderLockRegion(lock);
+        this.updatePointColors();
+        this.updateLockStatus();
+    },
+
+    removeLock(pointIndex) {
+        const lock = this.locks[pointIndex];
+        if (lock) {
+            if (lock.user_id === this.me.user_id) {
+                this.myLock = null;
+            }
+            delete this.locks[pointIndex];
+        }
+        this.lockMeshes = this.lockMeshes.filter(mesh => {
+            if (mesh.userData?.lockId === lock?.lock_id) {
+                this.scene.remove(mesh);
+                if (mesh.geometry) mesh.geometry.dispose();
+                if (mesh.material) {
+                    if (mesh.material.map) mesh.material.map.dispose();
+                    mesh.material.dispose();
+                }
+                return false;
+            }
+            return true;
+        });
+        this.updatePointColors();
+        this.updateLockStatus();
+    },
+
+    updateLockStatus() {
+        const releaseBtn = document.getElementById('releaseLockBtn');
+        const lockInfo = document.getElementById('lockInfo');
+        const noLockInfo = document.getElementById('noLockInfo');
+        const lockOwner = document.getElementById('lockOwner');
+        const lockPointCount = document.getElementById('lockPointCount');
+
+        const hasLocks = Object.keys(this.locks).length > 0;
+        if (hasLocks) {
+            const firstLock = Object.values(this.locks)[0];
+            lockInfo.style.display = 'block';
+            noLockInfo.style.display = 'none';
+            const lockUser = firstLock.user_id === this.me.user_id ? '我' : firstLock.username;
+            lockOwner.textContent = lockUser;
+            lockOwner.style.color = firstLock.user_color;
+            let totalPoints = 0;
+            for (const l of Object.values(this.locks)) {
+                totalPoints += l.locked_points.length;
+            }
+            lockPointCount.textContent = totalPoints;
+        } else {
+            lockInfo.style.display = 'none';
+            noLockInfo.style.display = 'block';
+        }
+
+        if (this.myLock) {
+            releaseBtn.style.display = 'inline-block';
+        } else {
+            releaseBtn.style.display = 'none';
+        }
+    },
+
+    startLockCheck() {
+        if (this.lockCheckInterval) {
+            clearInterval(this.lockCheckInterval);
+        }
+        this.lockCheckInterval = setInterval(() => {
+            const now = Date.now() / 1000;
+            let changed = false;
+            for (const [pointIdx, lock] of Object.entries(this.locks)) {
+                if (lock.expires_at < now) {
+                    delete this.locks[pointIdx];
+                    if (lock.user_id === this.me.user_id) {
+                        this.myLock = null;
+                    }
+                    changed = true;
+                }
+            }
+            if (changed) {
+                this.renderAllLocks();
+                this.updatePointColors();
+            }
+        }, 1000);
+    },
+
+    async acquireLock(pointIndex) {
+        if (!this.pointData || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return { success: false, message: '未连接到服务器' };
+        }
+        for (const lock of Object.values(this.locks)) {
+            if (lock.user_id !== this.me.user_id && lock.locked_points.includes(pointIndex)) {
+                return {
+                    success: false,
+                    message: `${lock.username} 正在标注这里，请稍候...`,
+                    existing_lock: lock
+                };
+            }
+        }
+        const centerPoint = this.pointData.positions[pointIndex];
+        return new Promise((resolve) => {
+            this._lockAckCallback = (result) => {
+                this._lockAckCallback = null;
+                resolve(result);
+            };
+            this.ws.send(JSON.stringify({
+                type: 'lock_acquire',
+                point_index: pointIndex,
+                center_point: centerPoint,
+                positions: this.pointData.positions,
+                radius: 1.0,
+                ttl: 5
+            }));
+            setTimeout(() => {
+                if (this._lockAckCallback) {
+                    this._lockAckCallback = null;
+                    resolve({ success: false, message: '申请锁超时' });
+                }
+            }, 6000);
+        });
+    },
+
+    releaseLock(pointIndex) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'lock_release',
+                point_index: pointIndex
+            }));
+        }
+        this.removeLock(pointIndex);
     },
 
     async loadTags() {
@@ -584,6 +854,9 @@ const App = {
         this.ws.onclose = () => {
             this.showToast('WebSocket 断开，正在重连...', true);
             clearInterval(this._heartbeat);
+            this.locks = {};
+            this.myLock = null;
+            this.clearLockMeshes();
             setTimeout(() => this.connectWebSocket(), 3000);
         };
         this.ws.onerror = () => {};
@@ -639,10 +912,40 @@ const App = {
                 document.getElementById('usernameInput').value = this.me.username;
                 document.getElementById('userColorInput').value = this.me.color;
                 break;
+            case 'locks_init':
+                this.locks = {};
+                msg.locks.forEach(lock => {
+                    this.locks[lock.point_index] = lock;
+                    if (lock.user_id === this.me.user_id) {
+                        this.myLock = lock;
+                    }
+                });
+                this.renderAllLocks();
+                this.updatePointColors();
+                break;
+            case 'lock_acquired':
+                this.addLock(msg.lock);
+                if (msg.by_user !== this.me.user_id) {
+                    this.showToast(`${msg.lock.username} 开始标注一个区域`, true);
+                }
+                break;
+            case 'lock_acquired_ack':
+                if (this._lockAckCallback) {
+                    this._lockAckCallback({
+                        success: msg.success,
+                        lock: msg.lock,
+                        existing_lock: msg.existing_lock,
+                        message: msg.message
+                    });
+                }
+                break;
+            case 'lock_released':
+                this.removeLock(msg.point_index);
+                break;
         }
     },
 
-    annotateSelectedPoints() {
+    async annotateSelectedPoints() {
         if (this.selectedPoints.size === 0) {
             this.showToast('请先选择点', true);
             return;
@@ -655,17 +958,48 @@ const App = {
             this.showToast('请先添加并选择一个标签', true);
             return;
         }
+        if (this.myLock) {
+            this.releaseLock(this.myLock.point_index);
+        }
+        const firstPoint = Array.from(this.selectedPoints)[0];
+        const lockResult = await this.acquireLock(firstPoint);
+        if (!lockResult.success) {
+            this.showToast(lockResult.message || '无法获取标注区域锁', true);
+            return;
+        }
+        const lock = lockResult.lock;
+        const overlapping = [];
+        for (const p of this.selectedPoints) {
+            if (!lock.locked_points.includes(p)) {
+                overlapping.push(p);
+            }
+        }
+        if (overlapping.length > 0 && overlapping.length !== this.selectedPoints.size) {
+            const proceed = confirm(`选中的 ${overlapping.length} 个点超出锁定区域（半径1cm），是否仅对锁定区域内的 ${lock.locked_points.length} 个点进行标注？`);
+            if (!proceed) {
+                this.releaseLock(lock.point_index);
+                return;
+            }
+        }
+        const pointsToAnnotate = lock.locked_points.filter(p => this.selectedPoints.has(p));
+        if (pointsToAnnotate.length === 0) {
+            this.showToast('选中的点不在锁定区域内', true);
+            this.releaseLock(lock.point_index);
+            return;
+        }
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify({
                 type: 'annotate',
-                point_indices: Array.from(this.selectedPoints),
-                label: this.selectedTag
+                point_indices: pointsToAnnotate,
+                label: this.selectedTag,
+                lock_point_index: lock.point_index
             }));
-            this.showToast(`已提交 ${this.selectedPoints.size} 个点的标注`);
+            this.showToast(`已提交 ${pointsToAnnotate.length} 个点的标注`);
             this.selectedPoints.clear();
             this.updatePointColors();
         } else {
             this.showToast('未连接到服务器', true);
+            this.releaseLock(lock.point_index);
         }
     },
 

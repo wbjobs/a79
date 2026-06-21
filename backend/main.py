@@ -14,7 +14,7 @@ from voxelizer import (
     voxelize_file, list_models, save_uploaded_model,
     get_model_path, load_voxelized, save_voxelized
 )
-from annotation_store import store, User, PointAnnotation
+from annotation_store import store, User, PointAnnotation, LockInfo
 
 
 app = FastAPI(title="3D Point Cloud Annotation API")
@@ -215,6 +215,80 @@ async def get_users(model_name: str):
     return {"users": [u.to_dict() for u in users]}
 
 
+@app.get("/api/models/{model_name}/locks")
+async def get_locks(model_name: str):
+    locks = store.get_all_locks(model_name)
+    result = []
+    for idx, lock in locks.items():
+        result.append(lock.to_dict())
+    return {"locks": result}
+
+
+@app.post("/api/models/{model_name}/locks/acquire")
+async def acquire_lock(model_name: str, payload: Dict[str, Any]):
+    point_index = payload.get("point_index")
+    center_point = payload.get("center_point")
+    positions = payload.get("positions")
+    user_id = payload.get("user_id")
+    username = payload.get("username", "unknown")
+    user_color = payload.get("user_color", "#ff0000")
+    radius = payload.get("radius", 1.0)
+    ttl = payload.get("ttl", 5)
+
+    if point_index is None or center_point is None or positions is None or user_id is None:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    user = User(user_id=user_id, username=username, color=user_color)
+    lock = store.acquire_lock(model_name, point_index, center_point, positions, user, radius, ttl)
+
+    if lock is None:
+        existing_lock = store.is_point_locked(model_name, point_index)
+        return {
+            "success": False,
+            "lock": None,
+            "existing_lock": existing_lock.to_dict() if existing_lock else None,
+            "message": existing_lock.username if existing_lock else "Failed to acquire lock"
+        }
+
+    await manager.broadcast(model_name, {
+        "type": "lock_acquired",
+        "lock": lock.to_dict(),
+        "by_user": user_id
+    })
+
+    return {
+        "success": True,
+        "lock": lock.to_dict(),
+        "message": "Lock acquired"
+    }
+
+
+@app.post("/api/models/{model_name}/locks/release")
+async def release_lock(model_name: str, payload: Dict[str, Any]):
+    point_index = payload.get("point_index")
+    user_id = payload.get("user_id")
+
+    if point_index is None or user_id is None:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    success = store.release_lock(model_name, point_index, user_id)
+
+    if success:
+        await manager.broadcast(model_name, {
+            "type": "lock_released",
+            "point_index": point_index,
+            "by_user": user_id
+        })
+
+    return {"success": success}
+
+
+@app.get("/api/models/{model_name}/conflict-logs")
+async def get_conflict_logs(model_name: str, limit: int = 100):
+    logs = store.get_conflict_logs(model_name, limit)
+    return {"logs": logs}
+
+
 @app.websocket("/ws/{model_name}")
 async def websocket_endpoint(websocket: WebSocket, model_name: str):
     await websocket.accept()
@@ -253,6 +327,14 @@ async def websocket_endpoint(websocket: WebSocket, model_name: str):
             "type": "tags_updated",
             "tags": tags
         })
+        locks = store.get_all_locks(model_name)
+        locks_list = []
+        for idx, lock in locks.items():
+            locks_list.append(lock.to_dict())
+        await websocket.send_json({
+            "type": "locks_init",
+            "locks": locks_list
+        })
         while True:
             msg = await websocket.receive_json()
             msg_type = msg.get("type", "")
@@ -274,11 +356,19 @@ async def websocket_endpoint(websocket: WebSocket, model_name: str):
             elif msg_type == "annotate":
                 point_indices = msg.get("point_indices", [])
                 label = msg.get("label", "")
+                lock_point_index = msg.get("lock_point_index")
                 if not point_indices or not label:
                     continue
                 user.last_active = time.time()
                 store.update_user(model_name, user)
                 annotations = store.annotate_points(model_name, point_indices, label, user)
+                if lock_point_index is not None:
+                    store.release_lock(model_name, lock_point_index, user_id)
+                    await manager.broadcast(model_name, {
+                        "type": "lock_released",
+                        "point_index": lock_point_index,
+                        "by_user": user_id
+                    })
                 await manager.broadcast(model_name, {
                     "type": "annotations_added",
                     "annotations": [a.to_dict() for a in annotations],
@@ -294,6 +384,45 @@ async def websocket_endpoint(websocket: WebSocket, model_name: str):
                     "point_index": point_index,
                     "by_user": user_id
                 })
+            elif msg_type == "lock_acquire":
+                point_index = msg.get("point_index")
+                center_point = msg.get("center_point")
+                positions = msg.get("positions")
+                radius = msg.get("radius", 1.0)
+                ttl = msg.get("ttl", 5)
+                if point_index is None or center_point is None or positions is None:
+                    continue
+                lock = store.acquire_lock(model_name, point_index, center_point, positions, user, radius, ttl)
+                if lock:
+                    await manager.broadcast(model_name, {
+                        "type": "lock_acquired",
+                        "lock": lock.to_dict(),
+                        "by_user": user_id
+                    })
+                    await websocket.send_json({
+                        "type": "lock_acquired_ack",
+                        "success": True,
+                        "lock": lock.to_dict()
+                    })
+                else:
+                    existing_lock = store.is_point_locked(model_name, point_index)
+                    await websocket.send_json({
+                        "type": "lock_acquired_ack",
+                        "success": False,
+                        "existing_lock": existing_lock.to_dict() if existing_lock else None,
+                        "message": existing_lock.username if existing_lock else "Failed to acquire lock"
+                    })
+            elif msg_type == "lock_release":
+                point_index = msg.get("point_index")
+                if point_index is None:
+                    continue
+                success = store.release_lock(model_name, point_index, user_id)
+                if success:
+                    await manager.broadcast(model_name, {
+                        "type": "lock_released",
+                        "point_index": point_index,
+                        "by_user": user_id
+                    })
             elif msg_type == "ping":
                 user.last_active = time.time()
                 store.update_user(model_name, user)

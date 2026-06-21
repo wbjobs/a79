@@ -31,6 +31,37 @@ class PointAnnotation:
         return asdict(self)
 
 
+@dataclass
+class LockInfo:
+    lock_id: str
+    point_index: int
+    center_point: List[float]
+    radius: float
+    locked_points: List[int]
+    user_id: str
+    username: str
+    user_color: str
+    acquired_at: float
+    expires_at: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ConflictLog:
+    log_id: str
+    model_name: str
+    point_index: int
+    requesting_user: Dict[str, str]
+    existing_lock_user: Dict[str, str]
+    timestamp: float
+    conflict_type: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class AnnotationStore:
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0):
         try:
@@ -342,6 +373,178 @@ class AnnotationStore:
         }
         return stats
 
+    def _find_points_in_radius(self, positions: List[List[float]], center: List[float],
+                               radius: float, exclude_indices: Optional[Set[int]] = None) -> List[int]:
+        import numpy as np
+        pos_arr = np.array(positions)
+        center_arr = np.array(center)
+        distances = np.linalg.norm(pos_arr - center_arr, axis=1)
+        radius_m = radius / 100.0
+        in_radius = np.where(distances <= radius_m)[0]
+        result = [int(i) for i in in_radius]
+        if exclude_indices:
+            result = [i for i in result if i not in exclude_indices]
+        return result
+
+    def acquire_lock(self, model_name: str, point_index: int, center_point: List[float],
+                     positions: List[List[float]], user: User,
+                     radius: float = 1.0, ttl: int = 5) -> Optional[LockInfo]:
+        radius_m = radius / 100.0
+        locked_points = self._find_points_in_radius(positions, center_point, radius)
+        locks_key = self._key("locks", model_name)
+        now = time.time()
+        expires_at = now + ttl
+        lock_id = f"lock_{model_name}_{point_index}_{int(now * 1000)}"
+        all_locks = self.get_all_locks(model_name)
+        for existing_lock in all_locks.values():
+            if existing_lock.expires_at < now:
+                continue
+            for p in locked_points:
+                if p in existing_lock.locked_points:
+                    conflict_log = ConflictLog(
+                        log_id=f"conflict_{int(now * 1000)}_{uuid.uuid4().hex[:8]}",
+                        model_name=model_name,
+                        point_index=point_index,
+                        requesting_user={"user_id": user.user_id, "username": user.username},
+                        existing_lock_user={
+                            "user_id": existing_lock.user_id,
+                            "username": existing_lock.username
+                        },
+                        timestamp=now,
+                        conflict_type="lock_overlap"
+                    )
+                    self._add_conflict_log(model_name, conflict_log)
+                    return None
+        lock_info = LockInfo(
+            lock_id=lock_id,
+            point_index=point_index,
+            center_point=center_point,
+            radius=radius,
+            locked_points=locked_points,
+            user_id=user.user_id,
+            username=user.username,
+            user_color=user.color,
+            acquired_at=now,
+            expires_at=expires_at
+        )
+        self._set_hash(locks_key, {str(point_index): lock_info.to_dict()})
+        if self.available:
+            self.redis.expire(self._key("locks", model_name), ttl + 10)
+        return lock_info
+
+    def release_lock(self, model_name: str, point_index: int, user_id: str) -> bool:
+        locks_key = self._key("locks", model_name)
+        existing = self.get_lock(model_name, point_index)
+        if not existing:
+            return False
+        if existing.user_id != user_id:
+            conflict_log = ConflictLog(
+                log_id=f"conflict_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+                model_name=model_name,
+                point_index=point_index,
+                requesting_user={"user_id": user_id, "username": "unknown"},
+                existing_lock_user={
+                    "user_id": existing.user_id,
+                    "username": existing.username
+                },
+                timestamp=time.time(),
+                conflict_type="unauthorized_release"
+            )
+            self._add_conflict_log(model_name, conflict_log)
+            return False
+        if self.available:
+            self.redis.hdel(locks_key, str(point_index))
+        else:
+            if locks_key in self._memory_hashes and str(point_index) in self._memory_hashes[locks_key]:
+                del self._memory_hashes[locks_key][str(point_index)]
+        return True
+
+    def get_lock(self, model_name: str, point_index: int) -> Optional[LockInfo]:
+        locks_key = self._key("locks", model_name)
+        data = self._get_hash(locks_key, str(point_index))
+        if not data or not isinstance(data, dict):
+            return None
+        lock_info = LockInfo(
+            lock_id=data.get("lock_id", ""),
+            point_index=data.get("point_index", point_index),
+            center_point=data.get("center_point", [0, 0, 0]),
+            radius=data.get("radius", 1.0),
+            locked_points=data.get("locked_points", []),
+            user_id=data.get("user_id", ""),
+            username=data.get("username", ""),
+            user_color=data.get("user_color", "#ff0000"),
+            acquired_at=data.get("acquired_at", time.time()),
+            expires_at=data.get("expires_at", time.time())
+        )
+        if lock_info.expires_at < time.time():
+            return None
+        return lock_info
+
+    def get_all_locks(self, model_name: str) -> Dict[int, LockInfo]:
+        locks_key = self._key("locks", model_name)
+        data = self._get_hash(locks_key)
+        result = {}
+        now = time.time()
+        for idx_str, lock_data in data.items():
+            if isinstance(lock_data, dict):
+                try:
+                    idx = int(idx_str)
+                    lock_info = LockInfo(
+                        lock_id=lock_data.get("lock_id", ""),
+                        point_index=idx,
+                        center_point=lock_data.get("center_point", [0, 0, 0]),
+                        radius=lock_data.get("radius", 1.0),
+                        locked_points=lock_data.get("locked_points", []),
+                        user_id=lock_data.get("user_id", ""),
+                        username=lock_data.get("username", ""),
+                        user_color=lock_data.get("user_color", "#ff0000"),
+                        acquired_at=lock_data.get("acquired_at", now),
+                        expires_at=lock_data.get("expires_at", now)
+                    )
+                    if lock_info.expires_at >= now:
+                        result[idx] = lock_info
+                except ValueError:
+                    continue
+        return result
+
+    def is_point_locked(self, model_name: str, point_index: int,
+                        exclude_user_id: Optional[str] = None) -> Optional[LockInfo]:
+        all_locks = self.get_all_locks(model_name)
+        for lock in all_locks.values():
+            if exclude_user_id and lock.user_id == exclude_user_id:
+                continue
+            if point_index in lock.locked_points:
+                return lock
+        return None
+
+    def _add_conflict_log(self, model_name: str, log: ConflictLog) -> bool:
+        logs_key = self._key("conflict_logs", model_name)
+        if self.available:
+            self.redis.lpush(logs_key, json.dumps(log.to_dict()))
+            self.redis.ltrim(logs_key, 0, 999)
+        else:
+            if logs_key not in self._memory:
+                self._memory[logs_key] = []
+            self._memory[logs_key].insert(0, json.dumps(log.to_dict()))
+            if len(self._memory[logs_key]) > 1000:
+                self._memory[logs_key] = self._memory[logs_key][:1000]
+        print(f"[CONFLICT LOG] {log.to_dict()}")
+        return True
+
+    def get_conflict_logs(self, model_name: str, limit: int = 100) -> List[Dict[str, Any]]:
+        logs_key = self._key("conflict_logs", model_name)
+        if self.available:
+            logs = self.redis.lrange(logs_key, 0, limit - 1) or []
+        else:
+            logs = self._memory.get(logs_key, [])[:limit]
+        result = []
+        for log_str in logs:
+            try:
+                result.append(json.loads(log_str))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return result
+
     def clear_model_annotations(self, model_name: str) -> bool:
         pattern = self._key("*", model_name, "*")
         if self.available:
@@ -349,7 +552,9 @@ class AnnotationStore:
             simple_keys = [self._key("users", model_name),
                            self._key("tags", model_name),
                            self._key("tag_colors", model_name),
-                           self._key("annotations", model_name)]
+                           self._key("annotations", model_name),
+                           self._key("locks", model_name),
+                           self._key("conflict_logs", model_name)]
             for k in simple_keys:
                 keys.append(k)
             for k in set(keys):
