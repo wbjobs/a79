@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D点云协作标注系统</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="container">
+        <div id="toolbar">
+            <div class="tool-group">
+                <label>模型:</label>
+                <select id="modelSelect"></select>
+                <button id="uploadBtn">上传模型</button>
+                <input type="file" id="fileInput" accept=".obj,.gltf,.glb" style="display:none">
+            </div>
+            <div class="tool-group">
+                <label>体素分辨率:</label>
+                <select id="resolutionSelect">
+                    <option value="32">32</option>
+                    <option value="64" selected>64</option>
+                    <option value="128">128</option>
+                    <option value="256">256</option>
+                </select>
+                <button id="voxelizeBtn">体素化</button>
+            </div>
+            <div class="tool-group">
+                <label>选择模式:</label>
+                <button id="modePoint" class="active">点选</button>
+                <button id="modeBox">框选</button>
+            </div>
+        </div>
+
+        <div id="left-panel">
+            <h3>标签列表</h3>
+            <div id="tagInputGroup">
+                <input type="text" id="newTagInput" placeholder="输入新标签（如：车门）">
+                <button id="addTagBtn">添加</button>
+            </div>
+            <div id="tagList"></div>
+            <h3 style="margin-top:20px">当前选中标签</h3>
+            <select id="currentTagSelect" size="5"></select>
+        </div>
+
+        <div id="viewer"></div>
+
+        <div id="right-panel">
+            <h3>在线用户</h3>
+            <div id="userList"></div>
+            <h3 style="margin-top:20px">你的信息</h3>
+            <div id="myInfo">
+                <div><label>昵称:</label><input type="text" id="usernameInput" placeholder="输入昵称"></div>
+                <div><label>颜色:</label><input type="color" id="userColorInput" value="#ff0000"></div>
+                <button id="saveUserBtn">保存</button>
+            </div>
+            <h3 style="margin-top:20px">标注统计</h3>
+            <div id="stats"></div>
+        </div>
+    </div>
+
+    <div id="selectionBox" class="hidden"></div>
+    <div id="loading" class="hidden">
+        <div class="spinner"></div>
+        <p id="loadingText">加载中...</p>
+    </div>
+    <div id="toast" class="hidden"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>
